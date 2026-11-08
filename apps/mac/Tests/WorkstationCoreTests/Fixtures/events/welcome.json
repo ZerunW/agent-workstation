@@ -1,0 +1,14 @@
+{
+ "type": "welcome",
+ "user": {
+  "name": "alice",
+  "createdAt": "2026-10-31T01:00:00.000Z",
+  "isAdmin": true,
+  "enabled": true,
+  "terminalEnabled": true,
+  "weeklyTokenLimit": null,
+  "modelAllowlist": null
+ },
+ "protocolVersion": 1,
+ "serverTime": "2026-10-31T02:00:00.000Z"
+}

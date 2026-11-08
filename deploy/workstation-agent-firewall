@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Defense in depth for keeping the AI account away from the hub. The hub and the status service have no TCP port in
+# production: they listen on Unix sockets the agent account cannot open (file permissions, packages/hub/src/identity.ts).
+# This adds a second layer: processes running as the agent account (Claude Code, terminal shells and everything they
+# start) get a TCP reset when they connect to ports 80 and 443 (WORKSTATION_AGENT_LOCAL_BLOCKED_PORTS) of any address of
+# this machine (`-m addrtype --dst-type LOCAL`: loopback, LAN and the Tailscale address alike), because nginx on the
+# Tailscale address forwards to the hub, and to the hub and status TCP ports (WORKSTATION_AGENT_BLOCKED_PORTS, rendered
+# by install.sh from [server] port and [status] port; default 9000,9100) on any address, which only a development setup
+# with `listen = "tcp"` uses.
+# Agents keep everything they need: the API key proxy and the browser MCP gateway listen on other (random) ports, and
+# the hub's tools run in-process.
+#
+# Installed root-owned to /usr/local/sbin by deploy/install.sh and run by workstation-agent-firewall.service.
+#   workstation-agent-firewall start   add/refresh the rules (idempotent)
+#   workstation-agent-firewall stop    remove them
+#   workstation-agent-firewall status  print them
+# Only touches its own chain WORKSTATION_AGENT and one jump to it from OUTPUT; never other rules, never inbound traffic.
+set -euo pipefail
+
+AGENT_USER="${WORKSTATION_AGENT_USER:-workstation-agent}"
+PORTS="${WORKSTATION_AGENT_BLOCKED_PORTS:-9000,9100}"
+LOCAL_PORTS="${WORKSTATION_AGENT_LOCAL_BLOCKED_PORTS:-80,443}"
+CHAIN=WORKSTATION_AGENT
+
+[[ $AGENT_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "workstation-agent-firewall: bad account name" >&2; exit 2; }
+[[ $PORTS =~ ^[0-9]{1,5}(,[0-9]{1,5}){0,14}$ ]] || { echo "workstation-agent-firewall: bad port list" >&2; exit 2; }
+[[ $LOCAL_PORTS =~ ^[0-9]{1,5}(,[0-9]{1,5}){0,14}$ ]] || { echo "workstation-agent-firewall: bad local port list" >&2; exit 2; }
+id -u "$AGENT_USER" >/dev/null 2>&1 || { echo "workstation-agent-firewall: account $AGENT_USER does not exist" >&2; exit 1; }
+
+start() {
+  local t
+  for t in iptables ip6tables; do
+    "$t" -w -N "$CHAIN" 2>/dev/null || true
+    "$t" -w -F "$CHAIN"
+    "$t" -w -A "$CHAIN" -m owner --uid-owner "$AGENT_USER" -p tcp -m multiport --dports "$PORTS" -j REJECT --reject-with tcp-reset
+    "$t" -w -A "$CHAIN" -m owner --uid-owner "$AGENT_USER" -p tcp -m addrtype --dst-type LOCAL -m multiport --dports "$LOCAL_PORTS" -j REJECT --reject-with tcp-reset
+    "$t" -w -C OUTPUT -j "$CHAIN" 2>/dev/null || "$t" -w -I OUTPUT 1 -j "$CHAIN"
+  done
+}
+
+stop() {
+  local t
+  for t in iptables ip6tables; do
+    while "$t" -w -C OUTPUT -j "$CHAIN" 2>/dev/null; do "$t" -w -D OUTPUT -j "$CHAIN"; done
+    "$t" -w -F "$CHAIN" 2>/dev/null || true
+    "$t" -w -X "$CHAIN" 2>/dev/null || true
+  done
+}
+
+case "${1:-}" in
+  start) start ;;
+  stop) stop ;;
+  status) for t in iptables ip6tables; do echo "== $t"; "$t" -w -S "$CHAIN" 2>/dev/null || echo "(no $CHAIN chain)"; "$t" -w -S OUTPUT | grep -F -- "-j $CHAIN" || true; done ;;
+  *) echo "usage: workstation-agent-firewall start|stop|status" >&2; exit 2 ;;
+esac

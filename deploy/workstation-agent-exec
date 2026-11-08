@@ -1,0 +1,512 @@
+#!/bin/bash
+# workstation-agent-exec: the only command the hub's account may run as the agent account. The sudoers drop-in
+# (/etc/sudoers.d/workstation-agent, installed by deploy/install.sh) is exactly:
+#
+#   workstation ALL=(workstation-agent) NOPASSWD: /opt/agent-workstation/bin/workstation-agent-exec
+#
+# Installed root-owned 0755 to /opt/agent-workstation/bin by install.sh, which fills in the settings block below. It runs
+# AS the agent account (sudo has already switched) and execs exactly one of claude or tmux (whose sessions run the
+# user's shell) with an environment rebuilt from an allowlist, in a cwd under the workspace root, after checking every
+# argument. Anything else is refused with exit status 126. The hub's side, with the same rules, is
+# packages/hub/src/sessions/agentExec.ts; deploy/test/workstation-agent-exec.test.sh tests this file (no sudo needed).
+#
+#   workstation-agent-exec claude|tmux <cwd> [--env NAME=VALUE]... [--stdin-secrets] -- <args>...
+#   workstation-agent-exec signal TERM|INT|HUP|KILL <pid of the sudo process that started the target>
+#   workstation-agent-exec rmtmp <TMP_ROOT>/<name>
+#   workstation-agent-exec fetch <FETCH_ROOT>/<name> <https URL> <pinned address> <max bytes> <timeout s>
+#   workstation-agent-exec fetchmv <FETCH_ROOT>/<name> <users root>/<user>/.chat/<session id>/downloads <file name>
+#   workstation-agent-exec fetchrm <FETCH_ROOT>/<name>
+#
+# fetch / fetchmv / fetchrm: chats' one-way download tool (packages/hub/src/sessions/download.ts). `fetch` creates the
+# fresh directory <FETCH_ROOT>/<22 base64url characters> (0700) and runs curl inside bubblewrap: a tmpfs root with only
+# /usr, /lib*, /bin, /sbin and the TLS certificates read-only, that directory the only writable (and the only other)
+# path, every namespace unshared but the network, a clean environment; curl GETs exactly one https URL (no config
+# file, no redirects, no cookies or extra headers) from the address the hub checked (`--resolve`: the URL's host is
+# never looked up again), within the size and time limits, into <dir>/body, and prints status, content type, redirect
+# target and size. The address must be public. `fetchmv` copies <dir>/body into the chat's downloads folder under the
+# given name, or name-1.ext, name-2.ext ... (never overwriting), prints the path and removes the directory; `fetchrm`
+# removes a directory after a redirect or an error.
+#
+# --stdin-secrets: stdin starts with NUL-terminated NAME=VALUE records closed by an empty record, read here byte by
+# byte so the target gets exactly the rest of stdin: ANTHROPIC_API_KEY (claude). Nothing secret or private goes into
+# argv: sudo logs every command line.
+#
+# Claude never gets the real Anthropic API key: ANTHROPIC_API_KEY must be a token of the hub's loopback key proxy
+# (hsk-...; anything that looks like a real key, sk-ant-..., is refused) and needs ANTHROPIC_BASE_URL, which is
+# accepted only as exactly http://127.0.0.1:<1-65535>.
+#
+# `signal` exists because sudo runs as root and the hub may not signal it; this signals the children of that sudo
+# process (as the agent account, so only the agent's own processes), and sudo exits with their status.
+#
+# Every Claude process gets a private temp directory (packages/hub/src/sessions/processTmp.ts): CLAUDE_CODE_TMPDIR must
+# be exactly $TMP_ROOT/<22 base64url characters>; it is created here (0700, a fresh name: an existing one is refused)
+# under $TMP_ROOT (0700, the agent's own) before Claude starts, and `rmtmp` removes it when the process has ended (the
+# hub cannot: the directory is the agent's). TMPDIR is accepted only as that same directory (chats: Claude Code's
+# sandbox puts its network bridge sockets there).
+set -euo pipefail
+umask 0002
+
+# ---- settings (install.sh rewrites these lines) ----
+AGENT_USER=workstation-agent
+AGENT_HOME=/home/workstation-agent
+WORK_ROOT=/srv/agent-workstation/users
+CLAUDE_BIN=/opt/agent-workstation/claude/bin/claude
+TMUX_BIN=/usr/bin/tmux
+# Where the hub publishes the plugins it generates for code sessions ([paths] agent_plugins_dir; install.sh creates it
+# owned by the hub's account, mode 0750, below root-owned folders). --plugin-dir is accepted only for
+# <PLUGINS_DIR>/<uuid>/(project|workstation) when nothing on that path can be written by the agent.
+PLUGINS_DIR=/var/lib/agent-workstation-plugins
+# Parent of the Claude processes' temp directories (short on purpose: see processTmp.ts; the hub uses the same path).
+TMP_ROOT=/tmp/hs
+# Chats' downloads (sessions/download.ts): bubblewrap, curl, and the parent of the download temp directories.
+BWRAP_BIN=/usr/bin/bwrap
+CURL_BIN=/usr/bin/curl
+FETCH_ROOT=/tmp/hf
+# ---- end of settings ----
+
+SHELLS=" /bin/bash /usr/bin/bash /bin/zsh /usr/bin/zsh /usr/bin/fish /bin/sh "
+UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+CLAUDE_MODEL_RE='^[A-Za-z0-9][]A-Za-z0-9._:@[-]{0,99}$'
+BUDGET_RE='^[0-9]{1,7}([.][0-9]{1,6})?$'
+SOURCES_RE='^((user|project|local)(,(user|project|local))*)?$'
+TMUX_NAME_RE='^term-[A-Za-z0-9_-]{1,100}$'
+ENV_VALUE_RE='^[A-Za-z0-9._:/,+=@-]{0,256}$'
+API_KEY_RE='^hsk-[A-Za-z0-9_-]{43}$'
+BASE_URL_RE='^http://127[.]0[.]0[.]1:([1-9][0-9]{0,4})$'
+TMP_NAME_RE='^[A-Za-z0-9_-]{22}$'
+# A download URL as the hub normalises it (download.ts checkDownloadUrl / agentExec.ts FETCH_URL_RE).
+FETCH_URL_RE='^https://([A-Za-z0-9.-]{1,253}|\[[0-9A-Fa-f:.]{2,45}\])(:443)?/[]A-Za-z0-9._~:/?#@!$&'"'"'()*+,;=%[-]*$'
+IPV4_RE='^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])[.]){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'
+IPV6_RE='^[0-9a-f:]{2,39}$'
+FETCH_FILE_RE='^[A-Za-z0-9][A-Za-z0-9._+-]{0,149}$'
+FETCH_DEST_RE='/[.]chat/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/downloads$'
+FETCH_MAX_BYTES=10737418240
+# The browser's MCP server as the hub passes it in --mcp-config (browserTools.ts / @agent-workstation/browser mcpEndpoint).
+BROWSER_MCP_RE='"browser":\{"type":"http","url":"http://127[.]0[.]0[.]1:[0-9]{1,5}/mcp/[a-z0-9_-]{1,32}","headers":\{"Authorization":"Bearer [A-Za-z0-9_-]{43}"(,"X-Workstation-Session":"[0-9a-f-]{36}")?\}\}'
+
+refuse() {
+  printf 'workstation-agent-exec: %s\n' "$*" >&2
+  exit 126
+}
+
+[ "$(id -u)" -ne 0 ] || refuse "must not run as root"
+[ "$(id -un)" = "$AGENT_USER" ] || refuse "must run as $AGENT_USER (sudo -u $AGENT_USER)"
+ROOT_REAL="$(realpath -e -- "$WORK_ROOT" 2>/dev/null)" || refuse "workspace root $WORK_ROOT is missing"
+
+# under_root PATH: PATH is absolute, exists and resolves (symlinks included) to the workspace root or inside it.
+under_root() {
+  local real
+  [[ $1 == /* ]] || return 1
+  real="$(realpath -e -- "$1" 2>/dev/null)" || return 1
+  [[ $real == "$ROOT_REAL" || $real == "$ROOT_REAL"/* ]]
+}
+
+no_ctrl() { [[ $1 != *[[:cntrl:]]* ]]; }
+
+# plugin_ok PATH: PATH is exactly (no symlink in it) <PLUGINS_DIR>/<uuid>/(project|workstation), and neither it nor any
+# folder above it up to / (nor anything inside it) is owned by the agent account or writable by group or others, so the
+# agent can neither change a plugin nor rename a folder to put its own in place. Fails closed.
+plugin_ok() {
+  local v=$1 real root p out mode owner
+  [[ $v == /* ]] && no_ctrl "$v" || return 1
+  real="$(realpath -e -- "$v" 2>/dev/null)" || return 1
+  root="$(realpath -e -- "$PLUGINS_DIR" 2>/dev/null)" || return 1
+  [[ $v == "$real" && $real == "$root"/* ]] || return 1
+  [[ ${real#"$root"/} =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/(project|workstation)$ ]] || return 1
+  p=$real
+  while :; do
+    out="$(stat -c '%U %a' -- "$p" 2>/dev/null)" || return 1
+    owner=${out%% *}
+    mode=${out##* }
+    [[ $owner != "$AGENT_USER" ]] || return 1
+    (((8#$mode & 8#022) == 0)) || return 1
+    [[ $p != / ]] || break
+    p="$(dirname -- "$p")"
+  done
+  out="$(find "$real" ! -type l \( -perm /022 -o -user "$AGENT_USER" \) -print -quit 2>/dev/null)" || return 1
+  [[ -z $out ]]
+}
+
+# is_tmp_dir PATH: exactly $TMP_ROOT/<22 base64url characters> (a Claude process's temp directory).
+is_tmp_dir() { [[ $1 == "$TMP_ROOT"/* && ${1#"$TMP_ROOT"/} =~ $TMP_NAME_RE ]]; }
+
+# tmp_root_ok: $TMP_ROOT is a real directory (not a symlink) of the agent account.
+tmp_root_ok() { [[ -d $TMP_ROOT && ! -L $TMP_ROOT && -O $TMP_ROOT ]]; }
+
+# is_fetch_dir PATH: exactly $FETCH_ROOT/<22 base64url characters> (a download's temp directory).
+is_fetch_dir() { [[ $1 == "$FETCH_ROOT"/* && ${1#"$FETCH_ROOT"/} =~ $TMP_NAME_RE ]]; }
+fetch_root_ok() { [[ -d $FETCH_ROOT && ! -L $FETCH_ROOT && -O $FETCH_ROOT ]]; }
+# fetch_dir_ok PATH: an existing download temp directory of the agent account (not a symlink).
+fetch_dir_ok() { is_fetch_dir "$1" && fetch_root_ok && [[ -d $1 && ! -L $1 && -O $1 ]]; }
+
+# public_ip ADDRESS: a public unicast address (the hub checks the same, download.ts isPublicAddress): no loopback,
+# private, link-local, CGNAT / tailnet, multicast, documentation or reserved IPv4; IPv6 only global unicast
+# (2000::/3, which leaves out ULA, the tailnet's fd7a:115c:a1e0::/48, link-local and multicast) minus documentation,
+# 6to4 and Teredo.
+public_ip() {
+  local ip=$1 a b c
+  if [[ $ip =~ $IPV4_RE ]]; then
+    IFS=. read -r a b c _ <<<"$ip"
+    ((a == 0 || a == 10 || a == 127 || a >= 224)) && return 1
+    ((a == 100 && b >= 64 && b <= 127)) && return 1
+    ((a == 169 && b == 254)) && return 1
+    ((a == 172 && b >= 16 && b <= 31)) && return 1
+    ((a == 192 && b == 168)) && return 1
+    ((a == 192 && b == 0 && (c == 0 || c == 2))) && return 1
+    ((a == 192 && b == 88 && c == 99)) && return 1
+    ((a == 198 && (b == 18 || b == 19))) && return 1
+    ((a == 198 && b == 51 && c == 100)) && return 1
+    ((a == 203 && b == 0 && c == 113)) && return 1
+    return 0
+  fi
+  [[ $ip =~ $IPV6_RE && $ip == *:* && $ip =~ ^[23][0-9a-f]{3}: ]] || return 1
+  [[ $ip == 2001:db8:* || $ip == 2002:* || $ip == 2001:0:* || $ip == 2001::* ]] && return 1
+  return 0
+}
+
+# ---- claude: the flags the Agent SDK builds (status 2 = unknown flag) ----
+claude_bool() {
+  case $1 in
+    --verbose | --include-partial-messages | --strict-mcp-config | --allow-dangerously-skip-permissions | \
+      --no-session-persistence | --include-hook-events | --continue | --fork-session | --thinking=adaptive | \
+      --thinking=disabled | --permission-prompt-tool=stdio | --version) return 0 ;;
+  esac
+  return 1
+}
+
+claude_value() {
+  local v=$2 sdk='"type":"sdk"'
+  case $1 in
+    --output-format | --input-format) [[ $v == stream-json ]] ;;
+    --model | --fallback-model) [[ $v =~ $CLAUDE_MODEL_RE ]] ;;
+    --effort) [[ $v =~ ^(low|medium|high|xhigh|max)$ ]] ;;
+    --max-turns | --max-thinking-tokens) [[ $v =~ ^[0-9]{1,7}$ ]] ;;
+    --max-budget-usd) [[ $v =~ $BUDGET_RE ]] ;;
+    --thinking-display) [[ $v =~ ^[a-z_]{1,20}$ ]] ;;
+    --resume | --session-id | --resume-session-at) [[ $v =~ $UUID_RE ]] ;;
+    --permission-mode) [[ $v =~ ^(default|acceptEdits|bypassPermissions|plan|dontAsk|auto)$ ]] ;;
+    --setting-sources) [[ $v =~ $SOURCES_RE ]] ;;
+    --allowedTools | --disallowedTools | --tools) ((${#v} <= 16000)) && no_ctrl "$v" ;;
+    # Only the hub's in-process (type "sdk") servers, plus the browser's MCP endpoint in exactly the shape the
+    # hub builds (loopback, the gateway's /mcp/<user> path, its bearer token): nothing that starts a command or names
+    # any other URL.
+    --mcp-config)
+      local rest=$v
+      [[ $rest =~ $BROWSER_MCP_RE ]] && rest=${rest/"${BASH_REMATCH[0]}"/}
+      ((${#v} <= 64000)) && no_ctrl "$v" && [[ $v == '{"mcpServers":'* ]] &&
+        [[ ${rest//"$sdk"/} != *'"type"'* && $rest != *'"command"'* && $rest != *'"url"'* ]]
+      ;;
+    # Inline JSON only, never a settings file path.
+    --settings) ((${#v} <= 64000)) && no_ctrl "$v" && [[ $v == '{'* ]] ;;
+    --add-dir) under_root "$v" ;;
+    # A plugin the hub generated (skills, commands, agents only; the SDK adds -no-mcp for plugins it must not read MCP
+    # servers from), never another plugin folder.
+    --plugin-dir | --plugin-dir-no-mcp) plugin_ok "$v" ;;
+    *) return 2 ;;
+  esac
+}
+
+# check_flags MODE ARGS...: every argument is a known boolean flag, or a known flag with a valid value
+# (`--flag=value` or `--flag value`).
+check_flags() {
+  local mode=$1 a f v rc
+  shift
+  while (($#)); do
+    a=$1
+    shift
+    if "${mode}_bool" "$a"; then continue; fi
+    if [[ $a == --*=* ]]; then
+      f=${a%%=*}
+      v=${a#*=}
+    else
+      f=$a
+      rc=0
+      "${mode}_value" "$f" "" || rc=$?
+      [[ $rc -ne 2 ]] || refuse "$mode: argument not allowed: ${a:0:80}"
+      (($#)) || refuse "$mode: $f needs a value"
+      v=$1
+      shift
+    fi
+    rc=0
+    "${mode}_value" "$f" "$v" || rc=$?
+    case $rc in
+      0) ;;
+      2) refuse "$mode: argument not allowed: ${a:0:80}" ;;
+      *) refuse "$mode: bad value for $f" ;;
+    esac
+  done
+}
+
+# ---- tmux: the five calls of the hub's terminal service ----
+check_tmux() {
+  local ok=1
+  case "${1-}" in
+    list-sessions) [[ $# -eq 3 && $2 == -F && $3 == '#{session_name}' ]] && ok=0 ;;
+    has-session | kill-session | attach-session) [[ $# -eq 3 && $2 == -t && $3 == =* && ${3#=} =~ $TMUX_NAME_RE ]] && ok=0 ;;
+    new-session)
+      [[ $# -eq 11 && $2 == -d && $3 == -s && $4 =~ $TMUX_NAME_RE && $5 == -c && $7 == -x && $8 =~ ^[0-9]{1,4}$ &&
+        $9 == -y && ${10} =~ ^[0-9]{1,4}$ && ${11} != *[[:space:]]* && $SHELLS == *" ${11} "* && -x ${11} ]] &&
+        under_root "$6" && ok=0
+      ;;
+  esac
+  ((ok == 0)) || refuse "tmux: call not allowed: ${*:1:2}"
+}
+
+env_allowed() {
+  case $2 in LANG | LC_ALL | TZ) return 0 ;; esac
+  case $1 in
+    claude) [[ $2 == ANTHROPIC_BASE_URL || $2 == TMPDIR || ($2 =~ ^CLAUDE_(CODE|AGENT_SDK)_[A-Z0-9_]{1,64}$ && ! $2 =~ ^CLAUDE_CODE_(SHELL|SHELL_PREFIX|GIT_BASH_PATH)$) ]] ;;
+    tmux) [[ $2 =~ ^(TERM|COLORTERM|WORKSTATION_USER)$ ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+API_KEY=""
+read_secrets() {
+  local rec name n=0
+  while :; do
+    IFS= read -r -d '' rec || refuse "stdin ended inside the secrets"
+    [[ -n $rec ]] || return 0
+    n=$((n + 1))
+    ((n <= 4)) || refuse "too many stdin records"
+    [[ $rec == *=* ]] || refuse "malformed stdin record"
+    name=${rec%%=*}
+    case "$1:$name" in
+      claude:ANTHROPIC_API_KEY)
+        [[ ${rec#*=} != [sS][kK]-[aA][nN][tT]-* ]] || refuse "refusing a real Anthropic API key (agent processes only get key proxy tokens)"
+        [[ ${rec#*=} =~ $API_KEY_RE ]] || refuse "malformed ANTHROPIC_API_KEY (not a key proxy token)"
+        API_KEY=${rec#*=}
+        ;;
+      *) refuse "stdin record ${name:0:64} not allowed for $1" ;;
+    esac
+  done
+}
+
+# ---- main ----
+(($# >= 1)) || refuse "no mode"
+MODE=$1
+shift
+
+if [[ $MODE == signal ]]; then
+  (($# == 2)) || refuse "signal: usage: signal TERM|INT|HUP|KILL <pid>"
+  [[ $1 =~ ^(TERM|INT|HUP|KILL)$ ]] || refuse "signal: bad signal"
+  [[ $2 =~ ^[1-9][0-9]{0,9}$ ]] || refuse "signal: bad pid"
+  # signal_children PARENT: signals the agent's own children of PARENT. Status 1 = PARENT had no such child.
+  signal_children() {
+    local parent=$1 stat pid line ppid _state _rest found=1
+    for stat in /proc/[0-9]*/stat; do
+      pid=${stat#/proc/}
+      pid=${pid%/stat}
+      [[ $pid != "$$" ]] || continue
+      line=""
+      IFS= read -r line <"$stat" 2>/dev/null || continue
+      # pid (comm) state ppid ...: comm may contain spaces and parentheses, so split after the last ") ".
+      read -r _state ppid _rest <<<"${line##*) }"
+      [[ $ppid == "$parent" && -O /proc/$pid ]] || continue
+      found=0
+      kill -s "$sig" "$pid" 2>/dev/null || true
+    done
+    return $found
+  }
+  sig=$1
+  signal_children "$2" || true
+  exit 0
+fi
+
+if [[ $MODE == rmtmp ]]; then
+  (($# == 1)) && is_tmp_dir "$1" || refuse "rmtmp: usage: rmtmp $TMP_ROOT/<22 characters>"
+  [[ -e $1 || -L $1 ]] || exit 0
+  tmp_root_ok && [[ -d $1 && ! -L $1 && -O $1 ]] || refuse "rmtmp: $1 is not a temp directory of $AGENT_USER"
+  rm -rf --one-file-system -- "$1"
+  exit 0
+fi
+
+if [[ $MODE == fetch ]]; then
+  (($# == 5)) || refuse "fetch: usage: fetch $FETCH_ROOT/<22 characters> <https URL> <address> <max bytes> <timeout s>"
+  dir=$1
+  url=$2
+  ip=$3
+  max=$4
+  secs=$5
+  is_fetch_dir "$dir" || refuse "fetch: the output directory must be $FETCH_ROOT/<22 characters>"
+  ((${#url} <= 2048)) && no_ctrl "$url" && [[ $url =~ $FETCH_URL_RE ]] || refuse "fetch: URL not allowed: ${url:0:80}"
+  host=${BASH_REMATCH[1]}
+  public_ip "$ip" || refuse "fetch: not a public address: ${ip:0:45}"
+  [[ $max =~ ^[1-9][0-9]{0,10}$ ]] && ((max <= FETCH_MAX_BYTES)) || refuse "fetch: bad size limit"
+  [[ $secs =~ ^[1-9][0-9]{0,3}$ ]] && ((secs <= 7200)) || refuse "fetch: bad time limit"
+  # A name is pinned to the address the hub checked (never looked up again); an address literal is its own pin.
+  resolve=()
+  if [[ $host == \[*\] ]]; then
+    [[ ${host:1:${#host}-2} == "$ip" ]] || refuse "fetch: the address must be the URL's own"
+  elif [[ $host =~ $IPV4_RE ]]; then
+    [[ $host == "$ip" ]] || refuse "fetch: the address must be the URL's own"
+  else
+    [[ $host == *[A-Za-z]* && $host != .* && $host != *..* ]] || refuse "fetch: bad host name"
+    if [[ $ip == *:* ]]; then resolve=(--resolve "$host:443:[$ip]"); else resolve=(--resolve "$host:443:$ip"); fi
+  fi
+  for bin in "$BWRAP_BIN" "$CURL_BIN"; do
+    if [[ ! -x $bin ]]; then
+      printf 'workstation-agent-exec: fetch: %s is not installed\n' "$bin" >&2
+      exit 127
+    fi
+  done
+  mkdir -m 0700 -- "$FETCH_ROOT" 2>/dev/null || true
+  fetch_root_ok || refuse "fetch: $FETCH_ROOT is not a directory of $AGENT_USER"
+  chmod 0700 -- "$FETCH_ROOT"
+  mkdir -m 0700 -- "$dir" 2>/dev/null || refuse "fetch: could not create $dir (it must not exist yet)"
+  # Nothing of the machine but the system's programs, libraries and certificates (read-only) and the output directory.
+  mounts=(--tmpfs /)
+  for p in /usr /lib /lib64 /lib32 /bin /sbin /etc/ssl /etc/ca-certificates /etc/pki; do
+    if [[ -L $p ]]; then
+      mounts+=(--symlink "$(readlink -- "$p")" "$p")
+    elif [[ -d $p ]]; then
+      mounts+=(--ro-bind "$p" "$p")
+    fi
+  done
+  mounts+=(--dev /dev --proc /proc --bind "$dir" "$dir" --chdir "$dir")
+  cd -- "$dir"
+  exec /usr/bin/env -i "PATH=/usr/bin:/bin" "LANG=C.UTF-8" "$BWRAP_BIN" --unshare-all --share-net --die-with-parent --new-session \
+    "${mounts[@]}" --setenv HOME "$dir" -- \
+    "$CURL_BIN" -q --silent --show-error --proto =https --max-redirs 0 ${resolve[@]+"${resolve[@]}"} --max-filesize "$max" --max-time "$secs" \
+    --globoff --output "$dir/body" --write-out '%{http_code}\n%{content_type}\n%{redirect_url}\n%{size_download}\n' --url "$url"
+fi
+
+if [[ $MODE == fetchmv ]]; then
+  (($# == 3)) || refuse "fetchmv: usage: fetchmv $FETCH_ROOT/<22 characters> <chat folder>/downloads <file name>"
+  dir=$1
+  dest=$2
+  name=$3
+  fetch_dir_ok "$dir" || refuse "fetchmv: $dir is not a download directory of $AGENT_USER"
+  [[ -f $dir/body && ! -L $dir/body ]] || refuse "fetchmv: no downloaded file in $dir"
+  [[ $name =~ $FETCH_FILE_RE ]] || refuse "fetchmv: bad file name"
+  no_ctrl "$dest" && [[ $dest =~ $FETCH_DEST_RE ]] || refuse "fetchmv: not a chat's downloads folder"
+  chat=${dest%/downloads}
+  under_root "$chat" && [[ -d $chat && ! -L $chat ]] || refuse "fetchmv: the chat folder is not under the workspace root"
+  if [[ -e $dest || -L $dest ]]; then
+    [[ -d $dest && ! -L $dest ]] || refuse "fetchmv: $dest is not a folder"
+  else
+    mkdir -m 0775 -- "$dest" || refuse "fetchmv: could not create $dest"
+  fi
+  # name, then stem-1.ext, stem-2.ext ... with .tar.<x> kept together (download.ts candidateNames does the same).
+  if [[ $name == ?*.tar.* && -n ${name##*.tar.} && ${name##*.tar.} != *.* ]]; then
+    stem=${name%.tar.*}
+    ext=.tar.${name##*.tar.}
+  elif [[ $name == ?*.* ]]; then
+    stem=${name%.*}
+    ext=.${name##*.}
+  else
+    stem=$name
+    ext=""
+  fi
+  for ((i = 0; i <= 1000; i++)); do
+    if ((i == 0)); then cand=$name; else cand="$stem-$i$ext"; fi
+    target="$dest/$cand"
+    [[ ! -e $target && ! -L $target ]] || continue
+    # Claim the name atomically (noclobber: O_EXCL), then fill it; never overwrite anything.
+    if (set -o noclobber && : >"$target") 2>/dev/null; then
+      if cat -- "$dir/body" >"$target"; then
+        rm -rf --one-file-system -- "$dir"
+        printf '%s\n' "$target"
+        exit 0
+      fi
+      rm -f -- "$target"
+      rm -rf --one-file-system -- "$dir"
+      refuse "fetchmv: could not write $target"
+    fi
+  done
+  rm -rf --one-file-system -- "$dir"
+  refuse "fetchmv: no free file name in $dest"
+fi
+
+if [[ $MODE == fetchrm ]]; then
+  (($# == 1)) && is_fetch_dir "$1" || refuse "fetchrm: usage: fetchrm $FETCH_ROOT/<22 characters>"
+  [[ -e $1 || -L $1 ]] || exit 0
+  fetch_dir_ok "$1" || refuse "fetchrm: $1 is not a download directory of $AGENT_USER"
+  rm -rf --one-file-system -- "$1"
+  exit 0
+fi
+
+case $MODE in
+  claude) BIN=$CLAUDE_BIN ;;
+  tmux) BIN=$TMUX_BIN ;;
+  *) refuse "unknown mode ${MODE:0:32}" ;;
+esac
+
+(($# >= 1)) || refuse "$MODE: no cwd"
+CWD=$1
+shift
+under_root "$CWD" && [[ -d $CWD ]] || refuse "$MODE: cwd is not a folder under the workspace root"
+
+# DISABLE_AUTOUPDATER: the Claude binary is root-owned (install.sh), so its auto-updater has nowhere to write.
+# DISABLE_TELEMETRY, DISABLE_ERROR_REPORTING: Claude Code sends no usage statistics or error reports of its own
+# (docs/PRIVACY.md). Requests to the model API are unaffected.
+ENVV=("HOME=$AGENT_HOME" "USER=$AGENT_USER" "LOGNAME=$AGENT_USER" "SHELL=/bin/bash" "LANG=C.UTF-8" "DISABLE_AUTOUPDATER=1"
+  "DISABLE_TELEMETRY=1" "DISABLE_ERROR_REPORTING=1"
+  "PATH=$AGENT_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin")
+SECRETS=0
+SEP=0
+HAVE_BASE_URL=0
+TMP_DIR=""
+TMPDIR_ENV=""
+while (($#)); do
+  case $1 in
+    --env)
+      (($# >= 2)) || refuse "$MODE: --env needs NAME=VALUE"
+      kv=$2
+      shift 2
+      name=${kv%%=*}
+      [[ $kv == *=* ]] && env_allowed "$MODE" "$name" && [[ ${kv#*=} =~ $ENV_VALUE_RE ]] ||
+        refuse "$MODE: environment not allowed: ${name:0:64}"
+      if [[ $name == ANTHROPIC_BASE_URL ]]; then
+        [[ ${kv#*=} =~ $BASE_URL_RE ]] && ((10#${BASH_REMATCH[1]} <= 65535)) ||
+          refuse "$MODE: ANTHROPIC_BASE_URL must be http://127.0.0.1:<port>"
+        HAVE_BASE_URL=1
+      fi
+      case $name in
+        CLAUDE_CODE_TMPDIR)
+          is_tmp_dir "${kv#*=}" || refuse "$MODE: CLAUDE_CODE_TMPDIR must be $TMP_ROOT/<22 characters>"
+          TMP_DIR=${kv#*=}
+          ;;
+        TMPDIR) TMPDIR_ENV=${kv#*=} ;;
+      esac
+      ENVV+=("$kv")
+      ;;
+    --stdin-secrets)
+      [[ $MODE != tmux ]] || refuse "tmux: no stdin secrets"
+      SECRETS=1
+      shift
+      ;;
+    --)
+      SEP=1
+      shift
+      break
+      ;;
+    *) refuse "$MODE: unexpected option ${1:0:80}" ;;
+  esac
+done
+((SEP)) || refuse "$MODE: missing -- before the arguments"
+[[ -z $TMPDIR_ENV || $TMPDIR_ENV == "$TMP_DIR" ]] || refuse "$MODE: TMPDIR must be the process's CLAUDE_CODE_TMPDIR"
+
+case $MODE in
+  claude) check_flags claude "$@" ;;
+  tmux) check_tmux "$@" ;;
+esac
+
+((SECRETS == 0)) || read_secrets "$MODE"
+[[ -z $API_KEY ]] || ((HAVE_BASE_URL)) || refuse "claude: a key proxy token needs ANTHROPIC_BASE_URL"
+
+ARGS=("$@")
+[[ -z $API_KEY ]] || ENVV+=("ANTHROPIC_API_KEY=$API_KEY")
+
+if [[ ! -x $BIN ]]; then
+  printf 'workstation-agent-exec: %s: %s is not installed\n' "$MODE" "$BIN" >&2
+  exit 127
+fi
+if [[ -n $TMP_DIR ]]; then
+  mkdir -m 0700 -- "$TMP_ROOT" 2>/dev/null || true
+  tmp_root_ok || refuse "$MODE: $TMP_ROOT is not a directory of $AGENT_USER"
+  chmod 0700 -- "$TMP_ROOT"
+  mkdir -m 0700 -- "$TMP_DIR" 2>/dev/null || refuse "$MODE: could not create $TMP_DIR (it must not exist yet)"
+fi
+cd -- "$CWD"
+exec /usr/bin/env -i "${ENVV[@]}" "$BIN" "${ARGS[@]}"

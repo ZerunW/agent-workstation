@@ -1,0 +1,45 @@
+# dependencies / build output
+node_modules/
+dist/
+build/
+.build/
+*.tsbuildinfo
+.vite/
+
+# local config and data (never commit machine-specific values)
+config/workstation.toml
+*.local.*
+*.sqlite
+*.sqlite-*
+*.db
+data/
+
+# secrets and keys (never commit; scripts/check-secrets.sh runs in CI)
+.env
+.env.*
+!.env.example
+anthropic.env
+*.pem
+*.key
+*.p12
+*.crt
+*.secret
+
+# test artifacts
+coverage/
+playwright-report/
+test-results/
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Swift
+apps/mac/.build/
+apps/mac/*.xcodeproj/xcuserdata/
+apps/mac/dist/
+
+# logs
+*.log

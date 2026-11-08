@@ -1,0 +1,13 @@
+{
+ "type": "usage_limits",
+ "limits": {
+  "api": {
+   "spentUsd": 164.5,
+   "limitUsd": 200,
+   "percent": 82.25,
+   "periodStart": "2026-10-01T00:00:00.000Z",
+   "resetsAt": "2026-11-01T00:00:00.000Z",
+   "severity": "warning"
+  }
+ }
+}

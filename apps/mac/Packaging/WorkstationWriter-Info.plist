@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Contents/XPCServices/WorkstationWriter.xpc/Contents/Info.plist (VERSION / BUILD substituted by the packaging script). -->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleExecutable</key><string>WorkstationWriter</string>
+  <key>CFBundleIdentifier</key><string>io.github.agentworkstation.writer</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleName</key><string>WorkstationWriter</string>
+  <key>CFBundlePackageType</key><string>XPC!</string>
+  <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+  <key>CFBundleVersion</key><string>${BUILD}</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>XPCService</key>
+  <dict>
+    <key>ServiceType</key><string>Application</string>
+  </dict>
+</dict>
+</plist>

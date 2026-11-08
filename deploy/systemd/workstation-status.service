@@ -1,0 +1,35 @@
+# workstation-status: metrics collector, health checks and the status page (/status/), on /run/agent-workstation/status.sock
+# (nginx connects there; no TCP port in production). It calls the hub through hub-local.sock.
+# /run/agent-workstation is created by tmpfiles.d (install.sh) and recreated by workstation-hub-prestart, not by a
+# RuntimeDirectory= of this unit: systemd may re-chown a RuntimeDirectory's contents when its ownership differs from the
+# unit's, which would reset the public socket's group and lock nginx out. tmpfiles does not touch the sockets.
+# Installed to /etc/systemd/system/ by deploy/install.sh.
+[Unit]
+Description=Agent Workstation status (metrics, health checks, status page)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Same account as the hub (reads /etc/agent-workstation/workstation.toml and the hub's data dir); sudo only for the rules of /etc/sudoers.d/workstation-agent.
+User=workstation
+Group=workstation
+WorkingDirectory=/opt/agent-workstation
+Environment=WORKSTATION_CONFIG=/etc/agent-workstation/workstation.toml
+Environment=NODE_ENV=production
+# /usr/sbin for smartctl.
+Environment=PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+ExecStart=/usr/local/bin/node packages/status/dist/main.js
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+# The monitor must never starve the hub or a build running on the machine.
+Nice=5
+MemoryMax=300M
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=workstation-status
+
+[Install]
+WantedBy=multi-user.target

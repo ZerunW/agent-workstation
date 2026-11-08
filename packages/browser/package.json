@@ -1,0 +1,41 @@
+{
+  "name": "@agent-workstation/browser",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Per-user server browser for Agent Workstation: headless Chromium with a persistent profile, a Playwright MCP endpoint for Claude, and a CDP screencast + input channel for the live view (in-process library, no routes)",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "scripts"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "install-browser": "node scripts/install-browser.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@agent-workstation/protocol": "0.1.0",
+    "@playwright/mcp": "0.0.84",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.6.3",
+    "vitest": "^5.1.0"
+  }
+}

@@ -1,0 +1,28 @@
+{
+ "type": "disk_status",
+ "status": {
+  "level": "warn",
+  "usedPercent": 84.2,
+  "totalBytes": 128000000000,
+  "freeBytes": 20000000000,
+  "warnPercent": 80,
+  "blockPercent": 95,
+  "breakdown": [
+   {
+    "label": "projects",
+    "user": "alice",
+    "path": "users/alice/projects",
+    "bytes": 5000000
+   }
+  ],
+  "projects": [
+   {
+    "id": "7b8c9d0e-1f2a-4b3c-8d4e-5f6a7b8c9d0e",
+    "name": "workstation",
+    "pendingFiles": 3,
+    "undownloadedFiles": 1,
+    "bytes": 5000000
+   }
+  ]
+ }
+}

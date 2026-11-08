@@ -1,0 +1,36 @@
+{
+  "name": "@agent-workstation/sync-core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Folder-sync and git-review engine for Agent Workstation projects (pure library, no HTTP): bare repo outside the work tree, `local` branch, review/accept/reject, snapshots and trash refs",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@agent-workstation/protocol": "0.1.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.3",
+    "vitest": "^5.1.0"
+  }
+}

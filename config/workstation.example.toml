@@ -1,0 +1,173 @@
+# Agent Workstation configuration. Copy to config/workstation.toml (git-ignored) and edit.
+# Both services (workstation-hub and workstation-status) read the same file. Lookup order:
+#   1. $WORKSTATION_CONFIG (must exist when set)
+#   2. ./config/workstation.toml  (relative to the working directory)
+#   3. /etc/agent-workstation/workstation.toml
+#   4. built-in defaults (the values below)
+
+[server]
+# How the hub is reached. "unix" (the default on Linux under systemd): no TCP port; the public socket below is for
+# nginx (mode 0660, group proxy_group) and the local socket for the status service (mode 0600, the service account's).
+# "tcp": one port on host:port, for development machines only; the hub refuses to start with it under systemd while
+# [agents] run_as is set. Leave this unset; the default is right for the install and for development.
+# listen = "unix"
+# socket = "/run/agent-workstation/hub.sock"
+# local_socket = "/run/agent-workstation/hub-local.sock"
+# Group of the public socket: nginx's account is a member, the agent account never is (deploy/install.sh).
+# proxy_group = "workstation-proxy"
+# With listen = "tcp" only.
+host = "127.0.0.1"
+port = 9000
+# Public base URL used in links and notifications. When this is a DNS name the status
+# page also checks that it resolves to this machine's Tailscale address.
+public_url = "http://localhost:9000"
+# Web origins (besides public_url, this server's Tailscale name and address, and http://127.0.0.1:<port>) whose pages may
+# call the hub. Other sites get 403 cross_site. Example: the web UI's dev server.
+# allowed_origins = ["http://localhost:5173"]
+
+[paths]
+# Root of all per-user workspaces: <users_root>/<username>/{inbox,projects,.chat,.claude}
+users_root = "/srv/agent-workstation/users"
+# SQLite databases, upload temp files and other mutable state.
+data_dir = "/var/lib/agent-workstation"
+# Claude Code binary (absolute path or name on PATH). Empty = the binary bundled with the Agent SDK. With
+# [agents] run_as the wrapper starts the root-owned /opt/agent-workstation/claude/bin/claude and this is not used.
+claude_bin = ""
+# Optional: directory of the built web UI to serve at "/" (default: packages/web/dist next to the hub).
+# web_dist = "/opt/agent-workstation/packages/web/dist"
+# Optional: Claude's ~/.claude directory (default: that of the run_as account, else $CLAUDE_CONFIG_DIR or
+# $HOME/.claude). Used for session transcripts.
+# claude_home = "/home/workstation-agent/.claude"
+# Optional: the repo's docs/ folder; the readme pages (web/Mac readme, the docs assistant, agents' read_workstation_docs)
+# are docs/readme/*.md, read on every request (default: docs/ two levels above the hub package).
+# docs_dir = "/opt/agent-workstation/docs"
+# Optional: where the hub publishes the plugins it generates for code sessions (skills, commands, agents). The agent account
+# must be able to read it but never write anything in it or above it (deploy/install.sh creates the default, owned by the
+# hub's account, mode 0750). Default with [agents] run_as: /var/lib/agent-workstation-plugins; else <data_dir>/agent-plugins.
+# agent_plugins_dir = "/var/lib/agent-workstation-plugins"
+
+[auth]
+# File holding the Anthropic API key (line `ANTHROPIC_API_KEY=...`). Create it yourself with mode 0600, owned by the
+# hub user; the hub reads it into memory only and never logs it. Without a key no session can start.
+anthropic_api_key_file = "/etc/agent-workstation/anthropic.env"
+# Usernames that get admin rights for requests without a Tailscale identity (the LAN while lan_access = "legacy",
+# local tools on this machine, everything while tailscale_identity is off). Empty by default: with Tailscale
+# identity on, admins are chosen by login (admin_logins below).
+admin_usernames = []
+# Identify tailnet clients (100.64.0.0/10, fd7a:115c:a1e0::/48; behind nginx via its X-Forwarded-For) by their
+# Tailscale login, asked from tailscaled (whois, cached 60 s per IP). A username is bound to the first login that
+# uses it; other logins get 403 user_bound. Tagged devices have no login and are refused. Keep it on.
+tailscale_identity = true
+# Tailscale logins that are admin (admin_usernames does not count for Tailscale-identified requests). Required while
+# tailscale_identity is on: the hub refuses to start with an empty list.
+# admin_logins = ["someone@example.com"]
+admin_logins = []
+# Requests not from a Tailscale address: "legacy" = the X-Workstation-User header names the user (admin only via admin_usernames),
+# "deny" = 403 lan_denied (the default). The local socket (the status service) is always the local service caller, legacy.
+lan_access = "deny"
+
+[sessions]
+# What a new session starts with when the user has not chosen their own default (web: sidebar ⚙ → Session
+# defaults; Mac: Settings → New sessions). Any model id from `GET /api/models`; effort low|medium|high|xhigh|max.
+# Admins can also change these at runtime from the admin settings (PATCH /api/admin/settings).
+default_model = "opus"
+default_effort = "high"
+# Maximum number of Claude Code processes running at the same time.
+max_active_processes = 6
+# Do not start a new process when MemAvailable (MiB) is below this.
+min_free_mem_mib = 1536
+# Reclaim a process after this many minutes without activity.
+idle_minutes = 10
+# Seconds to wait for a permission answer before denying and stopping the turn.
+permission_timeout_s = 600
+# Memory cap (MiB) for the commands of each Claude code session / chat with its own folder (Claude Code's
+# CLAUDE_CODE_TOOL_MEMORY_LIMIT). 0 = off. Needs the cgroup setup in deploy/README.md first, e.g. 3072 after it.
+tool_memory_limit_mb = 0
+# Read the settings files a project provides itself (.claude/settings.json, .mcp.json) in code sessions. They run as the
+# agent account (hooks, apiKeyHelper and other helper commands, MCP servers), so a synced repository could start commands
+# on the server. false = no settings file is read; the project's CLAUDE.md and .claude/CLAUDE.md go into the system prompt
+# and its skills, commands and agents load as plugins (/project:<name>).
+project_settings = false
+
+[limits]
+# Disk usage thresholds (percent of the users_root filesystem). Nothing is ever deleted
+# automatically: warn shows banners, block makes the hub read-only until space is freed.
+disk_warn_percent = 80
+disk_block_percent = 95
+# Default weekly token limit per user (input+output, rolling 7 days). 0 = unlimited.
+default_weekly_token_limit = 0
+# Global kill switch for remote sessions (admin can flip it at runtime).
+remote_claude_enabled = true
+
+[terminal]
+# Master switch. New users who are not admins start with their terminal off; admins turn it on per user.
+enabled = true
+shell = "/bin/bash"
+
+[agents]
+# Account that runs every AI process: Claude Code, terminal shells and whatever they start. Empty = the hub's own
+# user (dev machines). deploy/install.sh creates `workstation-agent` (no sudo, cannot read the hub's data, config or
+# API key) and sets this; the hub then starts everything with `sudo -n -u <run_as> <exec> ...`, the only sudo rule of
+# the hub's account.
+run_as = ""
+# The root-owned wrapper the sudoers rule allows (validates every argument).
+# exec = "/opt/agent-workstation/bin/workstation-agent-exec"
+# Home of run_as (default /home/<run_as>).
+# home = "/home/workstation-agent"
+
+[status]
+# The status service listens on /run/agent-workstation/status.sock (mode 0660, group [server] proxy_group; nginx proxies
+# /status/ to it) and asks the hub through its local socket. Same default rule as [server] listen: "tcp" is for development.
+# listen = "unix"
+# socket = "/run/agent-workstation/status.sock"
+# The hub's local socket (default [server] local_socket).
+# hub_socket = "/run/agent-workstation/hub-local.sock"
+# With listen = "tcp" only.
+host = "127.0.0.1"
+port = 9100
+sample_interval_s = 10
+health_interval_s = 60
+# Interface names to graph (missing interfaces show as gaps, not errors).
+interfaces = ["tailscale0"]
+# Periodic bandwidth probe in minutes (0 = off).
+speed_probe_interval_min = 60
+# Where the status service reaches the hub over TCP (development; default: the hub's local socket when the hub listens on
+# sockets, else http://<server.host>:<server.port>).
+# hub_url = "http://127.0.0.1:9000"
+# Username the status service presents to the hub's API (default "status").
+# hub_user = "status"
+# Hostname the DNS health check resolves (default: the host part of server.public_url when it is a name).
+# dns_check_host = "workstation.example.com"
+# Block device for the NVMe SMART check.
+nvme_device = "nvme0n1"
+
+[billing]
+# Every Claude process is paid by the Anthropic API key (auth.anthropic_api_key_file). Monthly budget in USD
+# (0 = nothing may start) and the day of month it resets. Admins can change both at runtime.
+api_monthly_limit_usd = 100
+api_reset_day = 1
+# The last this-many USD of each period are kept for the hub's own API services (the docs assistant, search ranking,
+# session summaries, the download check, the price check): sessions stop starting turns once the remaining budget is
+# down to it.
+service_reserve_usd = 2
+# Claude processes never get the key: they talk to a hub proxy on 127.0.0.1 with a per-process token, and the proxy
+# forwards to `upstream` with the key. Port 0 = a random free port per hub start.
+# proxy_port = 0
+# upstream = "https://api.anthropic.com"
+
+# Prices, USD per million tokens. They price every Claude request the key proxy meters (the API-credit spend), the live
+# cost of a running turn and usage rows whose CLI reports no cost. The hub has built-in Claude list prices; entries here
+# replace a model's built-in periods. Thinking tokens count as output; cache reads cost cache_read_per_mtok or
+# cache_read_factor × input; cache writes cost cache_write_5m_factor (1.25) / cache_write_1h_factor (2) × input.
+# A period applies from `from` (a period without `from` applies before the first dated one), by request/turn time, so
+# price changes never rewrite old costs. A daily price check (the hub fetches Anthropic's pricing page and Claude Haiku
+# reads it) adds override periods on top; check_time is its hub-local time.
+[pricing]
+check_time = "04:30"
+
+# [[pricing."claude-opus-5-5"]]
+# input_per_mtok = 4
+# output_per_mtok = 20
+# cache_read_per_mtok = 0.20
+# cache_write_5m_factor = 1.25
+# cache_write_1h_factor = 2

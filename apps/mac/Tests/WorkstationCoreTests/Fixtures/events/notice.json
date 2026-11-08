@@ -1,0 +1,7 @@
+{
+ "type": "notice",
+ "level": "warning",
+ "code": "claude_logged_out",
+ "message": "Claude login lost",
+ "at": "2026-10-31T02:00:00.000Z"
+}

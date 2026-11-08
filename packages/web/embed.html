@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <title>Agent Workstation embed</title>
+    <script>
+      // Paint the host's theme from the first frame: the config is injected at document start, the app bundle loads later.
+      try {
+        var c = window.workstationEmbedConfig;
+        var t = (c && typeof c.theme === "string" && c.theme) || new URLSearchParams(location.search).get("theme");
+        if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {}
+    </script>
+  </head>
+  <body class="embed">
+    <div id="root"></div>
+    <script type="module" src="/src/embed/main.tsx"></script>
+  </body>
+</html>

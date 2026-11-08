@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+# A newer push to the same ref supersedes a running build.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Every other package consumes packages/protocol/dist, so build it first.
+      # The hub imports the protocol, sync-core and browser packages through their built type declarations.
+      - name: Build libraries
+        run: npm run build:libs
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # docs/PROTOCOL.md is generated from packages/protocol. Fails when it is stale
+      # or when a route/event is not covered by the generator.
+      # Fix: npm run build -w packages/protocol && npx tsx scripts/gen-protocol-docs.mts
+      - name: Protocol docs drift check
+        run: npx tsx scripts/gen-protocol-docs.mts --check
+
+      # The deploy scripts: syntax, and the read-only nginx trust checks of nginx-tailscale.sh (plain bash, no nginx).
+      # deploy/test/workstation-agent-exec.test.sh needs a Linux host with the wrapper's tools; run it there.
+      - name: Deploy script checks
+        run: |
+          for f in deploy/*.sh deploy/workstation-agent-exec deploy/test/*.sh; do bash -n "$f"; done
+          bash deploy/test/proxy-trust.test.sh
+
+  # Fails when a tracked file holds an Anthropic API key, a private key block or a committed key / certificate / .env
+  # file (the tests' placeholder keys are allowed; see scripts/check-secrets.sh).
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan tracked files
+        run: |
+          bash scripts/test/check-secrets.test.sh
+          bash scripts/check-secrets.sh
+
+  mac:
+    name: macOS app
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Build
+        working-directory: apps/mac
+        run: swift build
+
+      - name: Test
+        working-directory: apps/mac
+        run: swift test

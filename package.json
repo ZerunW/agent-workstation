@@ -1,0 +1,36 @@
+{
+  "name": "agent-workstation",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted AI coding workstation: hub backend, web UI, status page and macOS app for a Linux server",
+  "license": "MIT",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build:libs": "npm run build -w packages/protocol && npm run build -w packages/sync-core && npm run build -w packages/browser",
+    "build": "npm run build -w packages/protocol && npm run build -w packages/sync-core && npm run build -w packages/web && npm run build -w packages/browser && npm run build -w packages/hub && npm run build -w packages/status",
+    "dev:hub": "npm run dev -w packages/hub",
+    "dev:web": "npm run dev -w packages/web",
+    "dev:status": "npm run dev -w packages/status",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "deploy": "bash deploy/deploy.sh"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.0"
+  },
+  "overrides": {
+    "katex": "^0.19.1",
+    "readdir-glob": {
+      "minimatch": "^11.0.1"
+    },
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "^11.0.1"
+    }
+  }
+}

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merge into AgentWorkstation.app/Contents/Info.plist so folders and files can be dropped on the Dock icon
+     (rank None: Agent Workstation never becomes the default app for anything). -->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Folder or file to link</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>None</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.folder</string>
+        <string>public.item</string>
+      </array>
+    </dict>
+  </array>
+</dict>
+</plist>

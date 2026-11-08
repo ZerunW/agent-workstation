@@ -1,0 +1,22 @@
+[Unit]
+Description=Agent Workstation: agent firewall, defense in depth (outbound TCP to ports 80 and 443 of this machine and to the hub and status TCP ports rejected for workstation-agent)
+Documentation=file:///opt/agent-workstation/deploy/README.md
+# Before the hub starts any agent process.
+Before=workstation-hub.service
+After=network-pre.target nftables.service
+# Restarted with nftables.service, whose stock ruleset starts with `flush ruleset`, and reloaded (ExecReload applies the
+# rules again) whenever nftables.service is reloaded.
+PartOf=nftables.service
+ReloadPropagatedFrom=nftables.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/workstation-agent-firewall start
+ExecReload=/usr/local/sbin/workstation-agent-firewall start
+ExecStop=/usr/local/sbin/workstation-agent-firewall stop
+
+[Install]
+# Re-applied whenever nftables.service (re)loads a ruleset that may flush it.
+WantedBy=multi-user.target nftables.service

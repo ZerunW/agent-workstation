@@ -1,0 +1,27 @@
+{
+  "name": "@agent-workstation/protocol",
+  "version": "0.1.0",
+  "description": "Shared REST/WebSocket contract (zod schemas + TypeScript types) between workstation-hub, the web UI and the macOS app",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vitest": "^5.1.0"
+  }
+}

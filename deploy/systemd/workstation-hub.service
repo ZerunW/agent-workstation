@@ -1,0 +1,52 @@
+# workstation-hub: sessions, files, sync, terminal, usage, and the web UI, on two Unix sockets in /run/agent-workstation
+# (hub.sock for nginx, hub-local.sock for the status service); no TCP port in production.
+# /run/agent-workstation is created by tmpfiles.d (install.sh) and by workstation-hub-prestart, not by this unit: the status
+# unit shares it, and systemd may re-chown a RuntimeDirectory's contents when its ownership differs from the unit's, which
+# would reset the public socket's group and lock nginx out. tmpfiles does not touch the sockets.
+# Installed to /etc/systemd/system/ by deploy/install.sh.
+[Unit]
+Description=Agent Workstation hub (sessions, files, sync, usage)
+After=network-online.target
+Wants=network-online.target
+# Never give up restarting, however often it crashes.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# The hub runs as `workstation`; Claude Code and terminals run as `workstation-agent` through
+# `sudo -n -u workstation-agent /opt/agent-workstation/bin/workstation-agent-exec` ([agents] run_as; the only sudo rule
+# of `workstation`). So no NoNewPrivileges= here: it would disable that sudo.
+User=workstation
+Group=workstation
+# The users' workspaces are shared with workstation-agent through this group (setgid dirs, group rw).
+SupplementaryGroups=workstation-work
+UMask=0002
+WorkingDirectory=/opt/agent-workstation
+Environment=WORKSTATION_CONFIG=/etc/agent-workstation/workstation.toml
+Environment=NODE_ENV=production
+# Read by workstation-hub-prestart (runs as root): owner and group of the users workspace root.
+Environment=WORKSTATION_SERVICE_USER=workstation
+Environment=WORKSTATION_WORK_GROUP=workstation-work
+# sudo, smartctl, ping in the system dirs (claude is workstation-agent's, run by the wrapper).
+Environment=PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+# The leading "+" runs this as root even though the service user is workstation:
+# it creates the users workspace root (default /srv/agent-workstation/users) if it is missing.
+ExecStartPre=+/usr/local/sbin/workstation-hub-prestart
+ExecStart=/usr/local/bin/node packages/hub/dist/main.js
+Restart=always
+RestartSec=3
+# Time for the hub to close Claude processes and flush SQLite on stop/restart.
+TimeoutStopSec=30
+# Only the hub process itself is signalled on stop/restart, so the tmux servers that
+# back web terminals (workstation-agent's, started through sudo in this unit's cgroup) survive a
+# hub restart and the hub re-attaches to them on start.
+# Claude CLI processes exit on their own when the hub's stdin pipe closes.
+KillMode=process
+LimitNOFILE=65536
+# Logs go to journald: journalctl -u workstation-hub -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=workstation-hub
+
+[Install]
+WantedBy=multi-user.target
